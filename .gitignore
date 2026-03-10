@@ -2,12 +2,7 @@
 
 node_modules/
 package-lock.json
-/.env
-/.env.*
-!/.env.example
-!/.env.*.example
 compose/.env
 compose/.env.production
-compose/.env.*
-!compose/.env.example
-!compose/.env.*.example
+compose/.env.local
+compose/.env.*.local

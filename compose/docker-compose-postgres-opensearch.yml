@@ -181,6 +181,7 @@ services:
 
   temporal-ui:
     <<: *service-defaults
+    read_only: true
     cap_drop:
       - ALL
     container_name: temporal-ui
@@ -198,6 +199,7 @@ services:
       - "${TEMPORAL_UI_BIND_ADDRESS}:${TEMPORAL_UI_PORT}:8080"
     tmpfs:
       - /home/ui-server/config
+      - /tmp
 
   postgres-exporter:
     <<: *service-defaults
