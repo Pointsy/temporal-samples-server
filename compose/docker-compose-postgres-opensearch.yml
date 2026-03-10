@@ -1,52 +1,94 @@
+x-service-defaults: &service-defaults
+  init: true
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-cli-defaults: &cli-defaults
+  <<: *service-defaults
+  read_only: true
+  cap_drop:
+    - ALL
+
 services:
   postgresql:
+    <<: *service-defaults
     image: postgres:${POSTGRESQL_VERSION}
     container_name: temporal-postgresql
-    ports:
-      - "5432:5432"
+    stop_grace_period: 60s
     environment:
-      POSTGRES_PASSWORD: temporal
-      POSTGRES_USER: temporal
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - ssl=off
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - max_connections=200
+    expose:
+      - "5432"
     networks:
-      - temporal-network
+      - temporal-backend
     volumes:
-      - /var/lib/postgresql/data
+      - temporal-postgresql-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U temporal"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
       timeout: 5s
-      retries: 60
+      retries: 12
       start_period: 30s
 
   opensearch:
+    <<: *service-defaults
     image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
     container_name: temporal-opensearch
-    ports:
-      - "9200:9200"
+    stop_grace_period: 90s
     environment:
-      - discovery.type=single-node
-      - OPENSEARCH_JAVA_OPTS=-Xms256m -Xmx256m
-      - cluster.routing.allocation.disk.threshold_enabled=true
-      - cluster.routing.allocation.disk.watermark.low=512mb
-      - cluster.routing.allocation.disk.watermark.high=256mb
-      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
-      - plugins.security.disabled=true
+      discovery.type: single-node
+      cluster.name: ${OPENSEARCH_CLUSTER_NAME}
+      node.name: temporal-opensearch
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: ${OPENSEARCH_JAVA_OPTS}
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      cluster.routing.allocation.disk.threshold_enabled: "true"
+      cluster.routing.allocation.disk.watermark.low: ${OPENSEARCH_DISK_WATERMARK_LOW}
+      cluster.routing.allocation.disk.watermark.high: ${OPENSEARCH_DISK_WATERMARK_HIGH}
+      cluster.routing.allocation.disk.watermark.flood_stage: ${OPENSEARCH_DISK_WATERMARK_FLOOD}
+      action.destructive_requires_name: "true"
+    expose:
+      - "9200"
     ulimits:
+      memlock:
+        soft: -1
+        hard: -1
       nofile:
         soft: 65536
         hard: 65536
     networks:
-      - temporal-network
+      - temporal-backend
     volumes:
-      - /usr/share/opensearch/data
+      - temporal-opensearch-data:/usr/share/opensearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 60
-      start_period: 30s
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
 
   temporal-admin-tools:
+    <<: *cli-defaults
     image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
     container_name: temporal-admin-tools
     restart: on-failure:6
@@ -56,55 +98,71 @@ services:
       opensearch:
         condition: service_healthy
     environment:
-      - DB=postgres12
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=postgresql
-      - SQL_PASSWORD=temporal
-      - ES_HOST=opensearch
-      - ES_PORT=9200
-      - ES_SCHEME=http
-      - ES_VERSION=v7
-      - ES_VISIBILITY_INDEX=temporal_visibility_v1_dev
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: postgresql
+      SQL_PASSWORD: ${POSTGRES_PASSWORD}
+      ES_HOST: opensearch
+      ES_PORT: "9200"
+      ES_SCHEME: http
+      ES_VERSION: v7
+      ES_VISIBILITY_INDEX: ${ES_VISIBILITY_INDEX}
     networks:
-      - temporal-network
+      - temporal-backend
     volumes:
-      - ./scripts:/scripts
+      - ./scripts:/scripts:ro
     entrypoint: ["/bin/sh"]
     command: /scripts/setup-postgres-opensearch.sh
 
   temporal:
+    <<: *service-defaults
     image: temporalio/server:${TEMPORAL_VERSION}
     container_name: temporal
+    stop_grace_period: 60s
     depends_on:
       temporal-admin-tools:
         condition: service_completed_successfully
     environment:
-      - DB=postgres12
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=postgresql
-      - ENABLE_ES=true
-      - ES_SEEDS=opensearch
-      - ES_VERSION=v7
-      - BIND_ON_IP=0.0.0.0
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: postgresql
+      ENABLE_ES: "true"
+      ES_SEEDS: opensearch
+      ES_PORT: "9200"
+      ES_SCHEME: http
+      ES_VERSION: v7
+      ES_VIS_INDEX: ${ES_VISIBILITY_INDEX}
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      LOG_LEVEL: ${TEMPORAL_LOG_LEVEL}
+      PROMETHEUS_ENDPOINT: 0.0.0.0:8000
+      SQL_MAX_CONNS: ${TEMPORAL_SQL_MAX_CONNS}
+      SQL_MAX_IDLE_CONNS: ${TEMPORAL_SQL_MAX_IDLE_CONNS}
+      SQL_VIS_MAX_CONNS: ${TEMPORAL_SQL_VIS_MAX_CONNS}
+      SQL_VIS_MAX_IDLE_CONNS: ${TEMPORAL_SQL_VIS_MAX_IDLE_CONNS}
+      NUM_HISTORY_SHARDS: ${TEMPORAL_NUM_HISTORY_SHARDS}
     networks:
-      - temporal-network
+      - temporal-backend
+      - temporal-edge
+    expose:
+      - "8000"
     ports:
-      - '7233:7233'
+      - "${TEMPORAL_BIND_ADDRESS}:${TEMPORAL_GRPC_PORT}:7233"
     volumes:
-      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7233"]
-      interval: 5s
-      timeout: 3s
+      interval: 10s
+      timeout: 5s
       start_period: 30s
-      retries: 60
+      retries: 18
 
   temporal-create-namespace:
+    <<: *cli-defaults
     image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
     container_name: temporal-create-namespace
     restart: on-failure:5
@@ -112,30 +170,120 @@ services:
       temporal:
         condition: service_healthy
     environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-      - DEFAULT_NAMESPACE=default
+      TEMPORAL_ADDRESS: temporal:7233
+      DEFAULT_NAMESPACE: ${TEMPORAL_DEFAULT_NAMESPACE}
     networks:
-      - temporal-network
+      - temporal-backend
     volumes:
-      - ./scripts:/scripts
+      - ./scripts:/scripts:ro
     entrypoint: ["/bin/sh"]
     command: /scripts/create-namespace.sh
 
   temporal-ui:
+    <<: *service-defaults
+    cap_drop:
+      - ALL
     container_name: temporal-ui
     depends_on:
       temporal:
         condition: service_healthy
     environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: ${TEMPORAL_UI_CORS_ORIGINS}
     image: temporalio/ui:${TEMPORAL_UI_VERSION}
     networks:
-      - temporal-network
+      - temporal-backend
+      - temporal-edge
     ports:
-      - 8080:8080
+      - "${TEMPORAL_UI_BIND_ADDRESS}:${TEMPORAL_UI_PORT}:8080"
+    tmpfs:
+      - /home/ui-server/config
+
+  postgres-exporter:
+    <<: *service-defaults
+    cap_drop:
+      - ALL
+    image: prometheuscommunity/postgres-exporter:${POSTGRES_EXPORTER_VERSION}
+    container_name: temporal-postgres-exporter
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_URI: postgresql:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: ${POSTGRES_USER}
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD}
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    expose:
+      - "9187"
+    networks:
+      - temporal-backend
+
+  prometheus:
+    <<: *service-defaults
+    cap_drop:
+      - ALL
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: temporal-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME}
+      - --web.enable-lifecycle
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgres-exporter:
+        condition: service_started
+    ports:
+      - "${PROMETHEUS_BIND_ADDRESS}:${PROMETHEUS_PORT}:9090"
+    networks:
+      - temporal-backend
+      - temporal-edge
+    volumes:
+      - ./deployment/prometheus/config-postgres-opensearch.yml:/etc/prometheus/prometheus.yml:ro
+      - temporal-prometheus-data:/prometheus
+
+  grafana:
+    <<: *service-defaults
+    cap_drop:
+      - ALL
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: temporal-grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_COOKIE_SECURE: "false"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_SECURITY_ALLOW_EMBEDDING: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_VIEWERS_CAN_EDIT: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "${GRAFANA_BIND_ADDRESS}:${GRAFANA_PORT}:3000"
+    networks:
+      - temporal-backend
+      - temporal-edge
+    volumes:
+      - ./deployment/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deployment/grafana/config-production.ini:/etc/grafana/config.ini:ro
+      - ./deployment/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - temporal-grafana-data:/var/lib/grafana
 
 networks:
-  temporal-network:
+  temporal-backend:
     driver: bridge
-    name: temporal-network
+    internal: true
+    name: temporal-backend
+  temporal-edge:
+    driver: bridge
+    name: temporal-edge
+
+volumes:
+  temporal-postgresql-data:
+  temporal-opensearch-data:
+  temporal-prometheus-data:
+  temporal-grafana-data:
